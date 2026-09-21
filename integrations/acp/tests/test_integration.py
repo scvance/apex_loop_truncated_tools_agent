@@ -90,7 +90,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
                 env["OPENAI_BASE_URL"] = env["OPENAI_API_BASE"]
             async with spawn_agent_process(
                 collector, sys.executable, "-m", "apex_acp", env=env, cwd=PROJECT
-            ) as (conn, proc):
+            ) as (conn, _proc):
                 init = await conn.initialize(protocol_version=PROTOCOL_VERSION)
                 self.assertTrue(init.agent_capabilities.mcp_capabilities.http)
                 session = await conn.new_session(
@@ -171,6 +171,66 @@ class Integration(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_stops_runner(self):
         await self.run_case(cancel=True)
+
+    async def missing_credentials_case(self, model):
+        with tempfile.TemporaryDirectory() as d:
+            base = f"http://127.0.0.1:{self.model_port}"
+            # Start clean so host keys, auth tokens, proxies, or model extra
+            # arguments cannot accidentally authenticate the runner.
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+                "APEX_LOG_DIR": d,
+                "HARBOR_ACP_REQUESTED_MODEL": model,
+                "AGENT_TIMEOUT_SEC": "60",
+                "OPENAI_API_BASE": f"{base}/v1",
+                "OPENAI_BASE_URL": f"{base}/v1",
+                "ANTHROPIC_API_BASE": base,
+            }
+            async with spawn_agent_process(
+                Collector(), sys.executable, "-m", "apex_acp", env=env, cwd=PROJECT
+            ) as (conn, _proc):
+                await conn.initialize(protocol_version=PROTOCOL_VERSION)
+                session = await conn.new_session(
+                    cwd=str(ROOT),
+                    mcp_servers=[
+                        HttpMcpServer(
+                            type="http",
+                            name="world",
+                            url=f"http://127.0.0.1:{self.mcp_port}/mcp",
+                            headers=[],
+                        )
+                    ],
+                )
+                # The client deadline is shorter than the runner's budget:
+                # waiting out AGENT_TIMEOUT_SEC must not satisfy this test.
+                with self.assertRaisesRegex(
+                    RequestError, r"did not complete \(error\)"
+                ):
+                    await asyncio.wait_for(
+                        conn.prompt(
+                            session_id=session.session_id,
+                            prompt=[text_block("Read the answer.")],
+                        ),
+                        25,
+                    )
+                native = json.loads(Path(d, "trajectory.native.json").read_text())
+                self.assertEqual(native["status"], "error")
+                log = Path(d, "agent_run.log").read_text()
+                self.assertIn("litellm.AuthenticationError", log)
+                self.assertNotIn("Agent run timed out", log)
+                summaries = [
+                    line for line in log.splitlines() if "llm_retry_summary" in line
+                ]
+                self.assertEqual(len(summaries), 1, log)
+                self.assertIn("attempts=1 status=failure", summaries[0])
+                self.assertIn("backoff_s=0.00", summaries[0])
+
+    async def test_missing_openai_credentials_fail_without_retry(self):
+        await self.missing_credentials_case("openai/test")
+
+    async def test_missing_anthropic_credentials_fail_without_retry(self):
+        await self.missing_credentials_case("anthropic/test")
 
 
 if __name__ == "__main__":
